@@ -1174,7 +1174,6 @@ class SessionDB:
         # in place at most once per SessionDB instance so a genuinely
         # unrecoverable database can't put writers into a rebuild loop.
         self._fts_runtime_rebuild_attempted = False
-        self._last_foreground_write_at = 0.0
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_unavailable_warned = False
@@ -1474,8 +1473,6 @@ class SessionDB:
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
-        *,
-        _worker: bool = False,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -1489,15 +1486,8 @@ class SessionDB:
         random 20-150ms, and retry — breaking the convoy pattern that
         SQLite's built-in deterministic backoff creates.
 
-        ``_worker=True`` marks background-maintenance writes (the deferred
-        FTS rebuild). All other writes stamp ``_last_foreground_write_at``,
-        which the rebuild worker watches to yield while a user is active.
-
         Returns whatever *fn* returns.
         """
-        if not _worker:
-            # Plain float store is atomic under the GIL — no lock needed.
-            self._last_foreground_write_at = time.monotonic()
         last_err: Optional[Exception] = None
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
@@ -1676,41 +1666,39 @@ class SessionDB:
                 self._conn.close()
                 self._conn = None
 
-    # ── Deferred FTS rebuild (schema v23) ──
+    # ── Chunked FTS rebuild engine (v23 opt-in optimize) ──
     #
-    # The v23 migration drops the old FTS indexes and defers the backfill of
-    # existing rows so startup never blocks (a blocking rebuild measured ~16
-    # minutes on a real 25 GB DB). The methods below run that backfill in
-    # small chunks, each in its own short write transaction, so:
+    # `optimize_fts_storage()` (the `hermes sessions optimize-storage`
+    # command) drops the legacy inline FTS indexes and backfills the new
+    # external-content ones. A single blocking rebuild measured ~16 minutes
+    # of held write lock on a real 25 GB DB, so the backfill runs in small
+    # chunks, each in its own short write transaction:
     #   - concurrent readers/writers are never starved (WAL stays small,
     #     each chunk checkpoints via the normal _execute_write cadence);
-    #   - an interrupted rebuild (process exit, crash) resumes from
-    #     fts_rebuild_progress on the next open;
+    #   - an interrupted run (Ctrl-C, crash) resumes from
+    #     fts_rebuild_progress when the command is re-run;
     #   - multiple processes sharing the DB don't double-run it — each chunk
     #     claims work by compare-and-swap on fts_rebuild_progress, so even a
-    #     concurrent second worker just interleaves chunks safely.
+    #     concurrent second runner just interleaves chunks safely.
     #
-    # THROTTLING (the part that keeps live sessions responsive): an early
-    # 5000-row/50ms-pause version monopolized the write lock ~85% of the
-    # time and visibly froze concurrent CLI sessions on a large install.
-    # Three layers prevent that:
+    # THROTTLING (the part that keeps a live gateway sharing the DB
+    # responsive): a greedy chunk loop re-acquires BEGIN IMMEDIATE nearly
+    # back-to-back and can starve another process's writer into exhausting
+    # its lock retries (an early 5000-row/50ms version owned the write lock
+    # ~85% of the time and visibly froze concurrent CLI sessions on a large
+    # install). Two layers prevent that:
     #   1. Small chunks (500 rows) — a foreground write queues behind a
     #      chunk for at most ~tens of ms.
-    #   2. Adaptive duty cycle — the worker sleeps a multiple of each
-    #      chunk's measured cost, capping its share of DB bandwidth at
-    #      roughly 1/(1+_FTS_REBUILD_DUTY_FACTOR).
-    #   3. Foreground-yield — _execute_write stamps the wall clock on every
-    #      NON-worker write; while that stamp is fresh the worker crawls
-    #      (one chunk per _FTS_REBUILD_YIELD_PAUSE), so the rebuild runs at
-    #      full speed only in usage gaps (same idle-gating idea as the
-    #      curator). The rebuild takes longer in wall time; nobody is
-    #      waiting on it.
+    #   2. Inter-chunk pause — the loop sleeps max(_FTS_REBUILD_MIN_PAUSE,
+    #      chunk cost x _FTS_REBUILD_DUTY_FACTOR) between chunks, capping
+    #      this process's share of DB bandwidth so concurrent writers always
+    #      find open windows. This works cross-process (unlike any
+    #      same-process activity stamp) because it bounds our own duty
+    #      cycle unconditionally.
 
     _FTS_REBUILD_CHUNK_ROWS = 500
     _FTS_REBUILD_DUTY_FACTOR = 4.0      # sleep >= 4x chunk cost (≤20% duty)
     _FTS_REBUILD_MIN_PAUSE = 0.2        # seconds — floor between chunks
-    _FTS_REBUILD_YIELD_WINDOW = 10.0    # seconds — foreground considered active
-    _FTS_REBUILD_YIELD_PAUSE = 2.0      # seconds — crawl pace while yielding
 
     def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """Return deferred-rebuild progress, or None when no rebuild pending.
@@ -1767,7 +1755,7 @@ class SessionDB:
                 "DELETE FROM state_meta WHERE key IN "
                 "('fts_rebuild_high_water', 'fts_rebuild_progress')"
             )
-        self._execute_write(_do, _worker=True)
+        self._execute_write(_do)
         logger.info("Deferred FTS rebuild complete — all messages indexed.")
 
     # Demoted v22 FTS shadow tables awaiting teardown (see the v23 migration:
@@ -1814,7 +1802,7 @@ class SessionDB:
             return True  # re-check: more trash tables / chunks may remain
 
         try:
-            return bool(self._execute_write(_do, _worker=True))
+            return bool(self._execute_write(_do))
         except sqlite3.OperationalError as exc:
             logger.debug("FTS trash teardown chunk failed (will retry): %s", exc)
             return True
@@ -1876,7 +1864,7 @@ class SessionDB:
             return upper < high_water
 
         try:
-            more = self._execute_write(_do, _worker=True)
+            more = self._execute_write(_do)
         except sqlite3.OperationalError as exc:
             logger.debug("FTS rebuild chunk failed (will retry): %s", exc)
             return True  # transient (lock contention) — caller retries
@@ -1887,115 +1875,48 @@ class SessionDB:
             return False
         return bool(more)
 
-    def start_deferred_fts_rebuild(self) -> bool:
-        """Start the deferred FTS backfill on a daemon thread if pending.
-
-        Returns True when a worker thread was started, False when there is
-        no pending rebuild (the common case) or one is already running in
-        this process. Called from SessionDB.__init__ — by whichever process
-        opens the DB first after the v23 migration; late-joining processes
-        also call it and the chunk-claim protocol keeps them safe.
-        """
-        if self.read_only or not self._fts_enabled:
-            return False
-        _has_backfill = self.get_meta("fts_rebuild_high_water") is not None
-        with self._lock:
-            _has_trash = bool(self._conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name LIKE ? ESCAPE '\\' LIMIT 1",
-                (self._FTS_TRASH_PREFIX.replace("_", "\\_") + "%",),
-            ).fetchone())
-        if not _has_backfill and not _has_trash:
-            return False
-        if getattr(self, "_fts_rebuild_thread", None) is not None \
-                and self._fts_rebuild_thread.is_alive():
-            return False
-
-        status = self.fts_rebuild_status()
-        if status is not None:
-            logger.info(
-                "Starting background FTS index rebuild: %s/%s messages indexed (%s%%)",
-                status["indexed"], status["total"], status["percent"],
-            )
-
-        def _pause_after_chunk(chunk_seconds: float) -> None:
-            """Adaptive worker pacing: cap duty cycle AND yield to users.
-
-            Sleep is the max of (a) the duty-cycle pause — a multiple of the
-            chunk's measured cost, so the worker never owns more than
-            ~1/(1+factor) of DB bandwidth — and (b) the foreground-yield
-            crawl pause when any non-worker write landed within the yield
-            window (a user is actively working; the rebuild can wait).
-            """
-            pause = max(
-                self._FTS_REBUILD_MIN_PAUSE,
-                chunk_seconds * self._FTS_REBUILD_DUTY_FACTOR,
-            )
-            fg_age = time.monotonic() - self._last_foreground_write_at
-            if fg_age < self._FTS_REBUILD_YIELD_WINDOW:
-                pause = max(pause, self._FTS_REBUILD_YIELD_PAUSE)
-            time.sleep(pause)
-
-        def _worker():
-            last_logged_pct = -10
-            try:
-                # Phase 1: backfill the new indexes (makes search whole again).
-                while True:
-                    if self._conn is None:  # DB closed — resume on next open
-                        return
-                    _t0 = time.monotonic()
-                    if not self.fts_rebuild_step():
-                        break
-                    _chunk_cost = time.monotonic() - _t0
-                    st = self.fts_rebuild_status()
-                    if st and st["percent"] >= last_logged_pct + 10:
-                        last_logged_pct = st["percent"] - (st["percent"] % 10)
-                        logger.info(
-                            "FTS index rebuild: %d%% (%d/%d messages)",
-                            st["percent"], st["indexed"], st["total"],
-                        )
-                    _pause_after_chunk(_chunk_cost)
-                # Phase 2: tear down the renamed-away v22 tables in chunks
-                # (space is then reclaimable via VACUUM / sessions optimize).
-                while True:
-                    if self._conn is None:
-                        return
-                    _t0 = time.monotonic()
-                    if not self._fts_teardown_trash_step():
-                        return
-                    _pause_after_chunk(time.monotonic() - _t0)
-            except Exception as exc:
-                # DB closed mid-chunk (AttributeError on a None _conn) is the
-                # normal shutdown race — the teardown resumes on next open.
-                # Anything else is logged; never take down the host process.
-                if self._conn is None:
-                    return
-                logger.warning("Background FTS rebuild paused: %s", exc)
-
-        self._fts_rebuild_thread = threading.Thread(
-            target=_worker, name="fts-rebuild", daemon=True
-        )
-        self._fts_rebuild_thread.start()
-        return True
-
-    # ── Opt-in v23 FTS storage optimization (`hermes db optimize`) ─────────
+    # ── Opt-in v23 FTS storage optimization (`hermes sessions optimize-storage`) ──
     #
     # This is the ONLY path that migrates an existing legacy (v22 inline) DB
     # to the v23 external-content schema. It is deliberately foreground and
     # user-invoked, never automatic, because it is disk-heavy and long. It
-    # reuses the same throttled/resumable machinery the (now-removed) auto
-    # path used — demote → new schema → chunked backfill → chunked teardown —
-    # but runs to completion synchronously with progress callbacks, does a
-    # disk preflight first, VACUUMs at the end, and bumps schema_version.
+    # runs the throttled/resumable chunk engine above to completion
+    # synchronously — demote → new schema → chunked backfill → chunked
+    # teardown — with progress callbacks, a disk preflight in the CLI
+    # wrapper, a VACUUM at the end, and a defensive schema_version bump.
 
     def fts_optimize_available(self) -> bool:
-        """True when this DB is a legacy inline-FTS install that can be
-        optimized to the v23 external-content schema. False for fresh/opted-in
-        installs (and when FTS5 is unavailable)."""
+        """True when `optimize_fts_storage()` has work to do: either this DB
+        is a legacy inline-FTS install that can be optimized to the v23
+        external-content schema, or a previous optimize run was interrupted
+        (legacy vtables already demoted, but backfill markers and/or trash
+        tables remain) and re-running would resume it. False for fresh and
+        fully-optimized installs (and when FTS5 is unavailable)."""
         if not self._fts_enabled or self.read_only:
             return False
         with self._lock:
-            return self._db_has_legacy_inline_fts(self._conn)
+            if self._db_has_legacy_inline_fts(self._conn):
+                return True
+            # Interrupted optimize: demotion already removed the legacy
+            # vtables (so the check above is False), but the transition is
+            # unfinished until the backfill markers are cleared and the
+            # demoted trash tables are torn down. Search stays complete
+            # through the gap supplement meanwhile; re-running resumes.
+            if self._conn.execute(
+                "SELECT 1 FROM state_meta "
+                "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
+            ).fetchone():
+                return True
+            return self._has_fts_trash(self._conn)
+
+    def _has_fts_trash(self, conn) -> bool:
+        """True when demoted v22 shadow tables are still awaiting teardown.
+        Caller must hold ``self._lock`` (or pass a migration-time cursor)."""
+        return bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name LIKE ? ESCAPE '\\' LIMIT 1",
+            (self._FTS_TRASH_PREFIX.replace("_", "\\_") + "%",),
+        ).fetchone())
 
     def _demote_legacy_fts_to_trash(self) -> int:
         """Demote the legacy inline FTS vtables and stage their shadow tables
@@ -2042,7 +1963,7 @@ class SessionDB:
                 )
             conn.execute("DELETE FROM state_meta WHERE key = 'fts_optimize_available'")
             return hw
-        return int(self._execute_write(_do, _worker=True))
+        return int(self._execute_write(_do))
 
     def optimize_fts_storage(
         self,
@@ -2086,17 +2007,39 @@ class SessionDB:
                 "total": st["total"] if st else 0,
             })
 
-        # Phase 1: backfill (foreground, throttle still applies so a live
+        def _pause(chunk_seconds: float) -> None:
+            """Inter-chunk throttle (see the chunk-engine note above).
+
+            The chunk methods themselves never sleep, so this loop is the
+            single place the duty cycle is enforced: without it, back-to-back
+            BEGIN IMMEDIATE chunks starve any live gateway/CLI process
+            sharing the DB out of its lock retries (the measured ~85%
+            write-lock ownership that froze concurrent sessions).
+            """
+            time.sleep(max(
+                self._FTS_REBUILD_MIN_PAUSE,
+                chunk_seconds * self._FTS_REBUILD_DUTY_FACTOR,
+            ))
+
+        # Phase 1: backfill (foreground, throttled between chunks so a live
         # gateway sharing the DB stays responsive).
         _emit("backfill")
-        while self.fts_rebuild_step():
+        while True:
+            _t0 = time.monotonic()
+            if not self.fts_rebuild_step():
+                break
             _emit("backfill")
+            _pause(time.monotonic() - _t0)
         _emit("backfill")
 
         # Phase 2: tear down the demoted legacy shadow tables in chunks.
         _emit("teardown")
-        while self._fts_teardown_trash_step():
+        while True:
+            _t0 = time.monotonic()
+            if not self._fts_teardown_trash_step():
+                break
             _emit("teardown")
+            _pause(time.monotonic() - _t0)
 
         # Phase 3: reclaim freed pages to the OS.
         vacuum_ok = None
@@ -2129,7 +2072,7 @@ class SessionDB:
                 "UPDATE schema_version SET version = ? WHERE version < ?",
                 (SCHEMA_VERSION, SCHEMA_VERSION),
             )
-        self._execute_write(_settle, _worker=True)
+        self._execute_write(_settle)
         _emit("done")
         logger.info(
             "FTS storage optimization complete (layout v%d).", FTS_STORAGE_VERSION
@@ -2530,8 +2473,21 @@ class SessionDB:
             # schema (see the v23 note above). Stamp the current layout so the
             # main version can always advance: a fresh/optimized DB is at
             # FTS_STORAGE_VERSION; a legacy DB is left at whatever it had
-            # (absent/0) until `optimize-storage` runs.
-            if fts5_available and not self._db_has_legacy_inline_fts(cursor):
+            # (absent/0) until `optimize-storage` runs. An INTERRUPTED
+            # optimize (legacy vtables already demoted, but rebuild markers
+            # or demoted trash tables still present) is NOT stamped either —
+            # the marker is the source of truth for "fully optimized", and
+            # `fts_optimize_available()` keeps offering the resume until the
+            # transition actually completes.
+            if (
+                fts5_available
+                and not self._db_has_legacy_inline_fts(cursor)
+                and cursor.execute(
+                    "SELECT 1 FROM state_meta "
+                    "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
+                ).fetchone() is None
+                and not self._has_fts_trash(cursor)
+            ):
                 self.set_meta(
                     "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
                 )

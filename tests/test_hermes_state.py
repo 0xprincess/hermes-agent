@@ -5356,6 +5356,53 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    def test_interrupted_optimize_reopen_still_reports_available(self, tmp_path):
+        """An interrupted optimize followed by a process restart must keep
+        offering the resume: the legacy vtables are gone (demoted), so the
+        legacy-shape check alone would say "already compact" — the gate has
+        to accept pending rebuild markers / trash tables too. And the reopen
+        must NOT stamp fts_storage_version (the transition isn't done)."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            db._demote_legacy_fts_to_trash()
+            db.fts_rebuild_step()  # one chunk, then "the process dies"
+        finally:
+            db.close()
+
+        # Fresh open, as the CLI would after the interrupt.
+        db = SessionDB(db_path=db_path)
+        try:
+            # The CLI gate must still offer optimize-storage (resume).
+            assert db.fts_optimize_available() is True
+            # The layout must NOT be stamped current mid-transition.
+            assert db.get_meta("fts_storage_version") is None
+            # Search stays complete through the gap supplement meanwhile.
+            assert len(db.search_messages("TOOLBLOB")) == 1
+
+            # Re-running the command resumes and completes the transition.
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert db.fts_optimize_available() is False
+            assert db.get_meta("fts_storage_version") == str(
+                hermes_state.FTS_STORAGE_VERSION
+            )
+            assert db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '%_v22_trash%'"
+            ).fetchall() == []
+            for term in ("TOOLBLOB", "deployment"):
+                assert db._conn.execute(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
+                    (term,),
+                ).fetchone()[0] == 1
+            db._conn.execute(
+                "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)"
+            )
+        finally:
+            db.close()
+
     def test_v23_fresh_db_born_optimized(self, tmp_path):
         """A brand-new DB is born on v23 — no legacy layout, no opt-in flag,
         no pending rebuild."""

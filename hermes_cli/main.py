@@ -6078,6 +6078,7 @@ def _print_fts_optimize_available_notice() -> None:
     if size_gb < 0.5:
         return
     db = None
+    interrupted = False
     try:
         db = SessionDB(db_path=db_path, read_only=True)
         # read_only opens skip schema init, so probe the layout directly.
@@ -6085,6 +6086,19 @@ def _print_fts_optimize_available_notice() -> None:
             "SELECT sql FROM sqlite_master "
             "WHERE type = 'table' AND name = 'messages_fts'"
         ).fetchone()
+        # An interrupted `optimize-storage` run: the table is already the
+        # v23 shape, but backfill markers / demoted trash tables remain.
+        # Offer the command again — re-running resumes and finishes it.
+        interrupted = bool(
+            db._conn.execute(
+                "SELECT 1 FROM state_meta "
+                "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
+            ).fetchone()
+            or db._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name LIKE 'fts\\_v22\\_trash\\_%' ESCAPE '\\' LIMIT 1"
+            ).fetchone()
+        )
     except Exception:
         return
     finally:
@@ -6094,8 +6108,19 @@ def _print_fts_optimize_available_notice() -> None:
             except Exception:
                 pass
     sql = (row[0] if row else "") or ""
-    if not sql or "tool_name" in sql:
+    if not sql or ("tool_name" in sql and not interrupted):
         # v23 layout already present (fresh/optimized) — nothing to offer.
+        return
+
+    if interrupted:
+        print()
+        print("◆ Session database optimization incomplete")
+        print(
+            "  A previous `hermes sessions optimize-storage` run was "
+            "interrupted. Search still works; re-run the command to resume "
+            "and finish reclaiming disk:"
+        )
+        print("    hermes sessions optimize-storage")
         return
 
     # Concrete size framing — lead with the savings the user cares about.
